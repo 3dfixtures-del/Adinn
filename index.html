@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Panorama Viewer — Final</title>
+
+  <!-- Use non-module UMD builds so it runs without importmap/module errors -->
+  <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #app { height: 100%; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+      background: #fff; color: #000;
+      overflow: hidden;
+    }
+
+    /* App layout */
+    .app { display: flex; flex-direction: column; height: 100vh; }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      padding: .6rem 1rem;
+      background: #fff;
+      border-bottom: 1px solid #ddd;
+    }
+    header .logo { height: 50px; width: auto; display: inline-block; }
+    header .brand { font-weight:700; font-size:1rem; color:#000; margin-left: .5rem; }
+    header .spacer { flex: 1; }
+    .controls { display:flex; gap:.5rem; align-items:center; }
+
+    button {
+      background: #000; color: #fff; border: 0; padding: .45rem .7rem;
+      border-radius:6px; cursor: pointer; font-size: 0.95rem;
+    }
+    button:hover { filter: brightness(1.08); }
+
+    main { display:flex; flex:1; min-height:0; } /* min-height to allow flex children to shrink */
+
+    /* Viewer container (canvas inserted here) */
+    #viewer-wrap { position: relative; flex: 1; display: block; overflow: hidden; }
+    /* we append canvas inside #viewer-canvas */
+    #viewer-canvas { width:100%; height:100%; display:block; }
+
+    /* Status / hint overlays */
+    .status {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      padding: .45rem .6rem;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font-size: .85rem;
+      z-index: 20;
+    }
+    .hint {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      padding: .45rem .6rem;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font-size: .85rem;
+      z-index: 20;
+    }
+
+    /* Sidebar thumbnails */
+    .sidebar {
+      width: 160px;
+      background: #f8f8f8;
+      border-left: 1px solid #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      gap: .6rem;
+      padding: .6rem;
+      overflow-y: auto;
+    }
+    .thumb { border-radius:6px; overflow:hidden; border:2px solid transparent; cursor:pointer; }
+    .thumb img { display:block; width:100%; height:auto; object-fit:cover; }
+    .thumb.active { border-color:#000; }
+
+    footer {
+      padding: .4rem 1rem;
+      background: #fff;
+      border-top: 1px solid #eee;
+      font-size: .82rem;
+      text-align: center;
+    }
+
+    /* Grab / grabbing cursor like Pannellum */
+    /* Note: the CSS applies to the canvas element we'll create dynamically */
+    canvas { cursor: grab; display:block; width:100%; height:100%; }
+    canvas:active { cursor: grabbing; }
+
+    /* Small spinner for loading */
+    .spinner {
+      width: 16px; height: 16px; border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-top-color: rgba(255,255,255,0.9);
+      animation: spin 1s linear infinite;
+      display: inline-block; vertical-align: middle;
+      margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Responsive: reduce sidebar width on small screens */
+    @media (max-width: 800px) {
+      .sidebar { width: 110px; padding: .4rem; }
+      header .brand { font-size: .95rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <header>
+      <!-- Put your logo at Images/Logo.jpg or change the path -->
+      <img src="Images/Logo.jpg" alt="Logo" class="logo" onerror="this.style.display='none'">
+      <div class="brand">Panorama Viewer</div>
+      <div class="spacer"></div>
+      <div class="controls">
+        <button id="btn-autorotate" title="Toggle autorotate">Autoplay: ON</button>
+        <button id="btn-reset" title="Reset view">Reset</button>
+      </div>
+    </header>
+
+    <main>
+      <div id="viewer-wrap">
+        <div id="viewer-canvas"></div>
+        <div class="status" id="status">Loading...</div>
+        <div class="hint">Drag (or touch) to look around • Double-click to fullscreen</div>
+      </div>
+
+      <aside class="sidebar" id="sidebar">
+        <!-- Thumbnails inserted here -->
+      </aside>
+    </main>
+
+    <footer>Tip: Use a high-resolution equirectangular image (2:1 ratio)</footer>
+  </div>
+
+  <script>
+  (function () {
+    // ----- CONFIG -----
+    const IMAGES = [
+      'Images/panorama1.jpg',
+      'Images/panorama2.jpg',
+      'Images/panorama3.jpg'
+    ];
+    const LOGO_PATH = 'Images/Logo.jpg'; // used in <img>, already in markup
+    // vertical limits in radians (pitch)
+    const MIN_PITCH = -Math.PI * 0.25; // -45°
+    const MAX_PITCH =  Math.PI * 0.25; //  45°
+    // pointer sensitivity
+    const SENSITIVITY = 0.0025; // adjust for drag speed
+    // damping factor for inertia (0..1). Lower = stronger smoothing.
+    const DAMPING = 0.08;
+    // autoplay speed (radians per second). Positive = same direction as manual drag.
+    const AUTOPLAY_SPEED = 0.05; // smaller = slower
+
+    // ----- STATE -----
+    let scene, camera, renderer, textureLoader;
+    let sphereMesh = null;
+    let canvasEl = null;
+
+    // angles (radians):
+    let yaw = 0;         // current yaw (theta)
+    let pitch = 0;       // current pitch
+    let targetYaw = 0;   // target yaw (for smoothing)
+    let targetPitch = 0; // target pitch
+    let isPointerDown = false;
+    let pointerStartX = 0, pointerStartY = 0;
+    let baseTargetYaw = 0, baseTargetPitch = 0;
+    let isTouch = false;
+
+    let autoplay = true;
+    const statusEl = document.getElementById('status');
+    const sidebarEl = document.getElementById('sidebar');
+    const btnAuto = document.getElementById('btn-autorotate');
+    const btnReset = document.getElementById('btn-reset');
+
+    // ----- Init three.js -----
+    function init() {
+      const container = document.getElementById('viewer-canvas');
+
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 2000);
+      camera.position.set(0, 0, 0.1);
+      camera.up.set(0, 1, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(window.devicePixelRatio || 1);
+      renderer.setSize(container.clientWidth, container.clientHeight);
+
+      // Ensure output matches how images look in browsers
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.NoToneMapping;
+
+      renderer.domElement.style.display = 'block';
+      container.appendChild(renderer.domElement);
+      canvasEl = renderer.domElement;
+
+      // create inverted sphere (normals face inward)
+      const geometry = new THREE.SphereGeometry(500, 60, 40);
+      geometry.scale(-1, 1, 1); // invert
+      const material = new THREE.MeshBasicMaterial({ color: 0xffffff });
+      sphereMesh = new THREE.Mesh(geometry, material);
+      scene.add(sphereMesh);
+
+      textureLoader = new THREE.TextureLoader();
+
+      // events
+      window.addEventListener('resize', onWindowResize, { passive: true });
+      canvasEl.addEventListener('pointerdown', onPointerDown);
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerup', onPointerUp);
+      canvasEl.addEventListener('wheel', onWheel, { passive: false });
+      canvasEl.addEventListener('dblclick', onDoubleClick);
+      // touch fallback: pointer events handle touch already
+
+      // Fill sidebar and load first image
+      buildSidebar(IMAGES);
+      loadPanorama(IMAGES[0]).then(() => {
+        statusEl.textContent = 'Viewing: ' + getFilename(IMAGES[0]);
+        // start with small yaw offset for nicer look
+        yaw = targetYaw = 0;
+        pitch = targetPitch = 0;
+      });
+
+      // wire buttons
+      btnAuto.addEventListener('click', () => {
+        autoplay = !autoplay;
+        btnAuto.textContent = autoplay ? 'Autoplay: ON' : 'Autoplay: OFF';
+      });
+      btnReset.addEventListener('click', () => {
+        // smooth reset by setting targets
+        targetYaw = 0; targetPitch = 0;
+      });
+
+      // cursor initial
+      canvasEl.style.cursor = 'grab';
+    }
+
+    // ----- Sidebar thumbnails -----
+    function buildSidebar(list) {
+      sidebarEl.innerHTML = '';
+      list.forEach((src, idx) => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'thumb';
+        wrapper.title = getFilename(src);
+
+        const img = document.createElement('img');
+        img.src = src;
+        img.alt = 'thumb' + idx;
+        img.style.width = '100%';
+        img.style.display = 'block';
+        wrapper.appendChild(img);
+
+        wrapper.addEventListener('click', () => {
+          // load panorama but keep current yaw/pitch
+          loadPanorama(src).then(() => {
+            // mark active
+            document.querySelectorAll('.thumb').forEach(t => t.classList.remove('active'));
+            wrapper.classList.add('active');
+            statusEl.textContent = 'Viewing: ' + getFilename(src);
+          }).catch(() => {
+            statusEl.textContent = 'Failed to load: ' + getFilename(src);
+          });
+        });
+
+        // mark first active
+        if (idx === 0) wrapper.classList.add('active');
+
+        sidebarEl.appendChild(wrapper);
+      });
+    }
+
+    // ----- Load texture -----
+    function loadPanorama(path) {
+        statusEl.innerHTML = `<span class="spinner"></span> Loading: ${escapeHtml(getFilename(path))}`;
+        return new Promise((resolve, reject) => {
+         textureLoader.load(
+         path,
+        (tex) => {
+                    // Correct color space so the image is not dark
+                    tex.colorSpace = THREE.SRGBColorSpace;
+
+                    if (sphereMesh.material.map) {
+                      sphereMesh.material.map.dispose();
+                    }
+                    sphereMesh.material.map = tex;
+                    sphereMesh.material.needsUpdate = true;
+
+                    statusEl.textContent = 'Viewing: ' + getFilename(path);
+                    resolve(tex);
+                },
+                     undefined,
+                    (err) => {
+                    console.error('Texture load error', err);
+                    statusEl.textContent = 'Failed to load image';
+                    reject(err);
+             }
+         );
+        });
+    }
+
+
+    // ----- Input handlers (custom drag) -----
+    function onPointerDown(e) {
+      // only primary button
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      isPointerDown = true;
+      pointerStartX = e.clientX;
+      pointerStartY = e.clientY;
+      baseTargetYaw = targetYaw;
+      baseTargetPitch = targetPitch;
+      isTouch = (e.pointerType === 'touch');
+      canvasEl.setPointerCapture?.(e.pointerId);
+      canvasEl.style.cursor = 'grabbing';
+      // stop autoplay while user is interacting (optional). If you want autoplay to continue, remove this line
+      // autoplay = autoplay; // keep as-is; we won't change autoplay automatically
+    }
+
+    function onPointerMove(e) {
+      if (!isPointerDown) return;
+      // update target yaw/pitch based on movement
+      const dx = e.clientX - pointerStartX;
+      const dy = e.clientY - pointerStartY;
+      // pointer drag: left/right should move panorama same direction as hand (natural)
+      // targetYaw increases when user drags left (dx < 0) -> we make sign so natural drag moves view same way
+      targetYaw = baseTargetYaw + dx * SENSITIVITY * -1; // adjust sign if you'd prefer opposite
+      targetPitch = baseTargetPitch + dy * SENSITIVITY ;
+      // clamp pitch
+      targetPitch = Math.max(MIN_PITCH, Math.min(MAX_PITCH, targetPitch));
+    }
+
+    function onPointerUp(e) {
+      if (!isPointerDown) return;
+      isPointerDown = false;
+      canvasEl.releasePointerCapture?.(e.pointerId);
+      canvasEl.style.cursor = 'grab';
+    }
+
+    // Wheel zoom (change camera fov)
+    function onWheel(e) {
+      e.preventDefault();
+      const delta = e.deltaY;
+      let fov = camera.fov + delta * 0.02;
+      fov = Math.max(30, Math.min(100, fov));
+      camera.fov = fov;
+      camera.updateProjectionMatrix();
+    }
+
+    function onDoubleClick() {
+      const elem = document.getElementById('viewer-wrap');
+      if (!document.fullscreenElement) {
+        elem.requestFullscreen?.();
+      } else {
+        document.exitFullscreen?.();
+      }
+    }
+
+    // ----- Animation loop -----
+    let lastTime = performance.now();
+    function animate(now) {
+      requestAnimationFrame(animate);
+      const dt = Math.max(0, (now - lastTime) / 1000);
+      lastTime = now;
+
+      // autoplay drives targetYaw (unless user is dragging; here we still allow autoplay to affect target even while dragging.
+      if (autoplay && !isPointerDown) {
+        targetYaw += AUTOPLAY_SPEED * dt; // positive -> same direction as manual drag mapping above
+      }
+
+      // smooth angles with damping (simple lerp)
+      yaw += (targetYaw - yaw) * (1 - Math.pow(1 - DAMPING, dt * 60)); // frame-rate independent easing
+      pitch += (targetPitch - pitch) * (1 - Math.pow(1 - DAMPING, dt * 60));
+
+      // convert yaw/pitch to a target vector and have camera look at it
+      // yaw = theta around Y, pitch = rotation up/down (-pi/2..pi/2)
+      const phi = Math.PI / 2 - pitch; // convert pitch to phi
+      const theta = yaw;
+
+      const x = Math.sin(phi) * Math.cos(theta);
+      const y = Math.cos(phi);
+      const z = Math.sin(phi) * Math.sin(theta);
+
+      camera.lookAt(new THREE.Vector3(x, y, z));
+      renderer.render(scene, camera);
+    }
+
+    // ----- Helpers -----
+    function onWindowResize() {
+      const container = document.getElementById('viewer-canvas');
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+    function getFilename(path) {
+      return path.split('/').pop();
+    }
+
+    // ----- Start -----
+    init();
+    requestAnimationFrame(animate);
+  })();
+  </script>
+</body>
+</html>
