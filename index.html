@@ -48,7 +48,7 @@
     .status { left: 12px; bottom: 12px; }
     .hint { right: 12px; bottom: 12px; }
 
-    /* Sidebar thumbnails (default: right side for desktop) */
+    /* Sidebar thumbnails (desktop default) */
     .sidebar {
       width: 160px; background: #f8f8f8; border-left: 1px solid #e0e0e0;
       display: flex; flex-direction: column; gap: .6rem;
@@ -75,11 +75,9 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* -------- MOBILE VIEW FIX -------- */
+    /* -------- MOBILE VIEW -------- */
     @media (max-width: 800px) {
-      main {
-        flex-direction: column; /* stack vertically */
-      }
+      main { flex-direction: column; }
       .sidebar {
         width: 100%; height: auto;
         flex-direction: row; justify-content: center; align-items: center;
@@ -127,9 +125,17 @@
     ];
     const MIN_PITCH = -Math.PI * 0.25;
     const MAX_PITCH =  Math.PI * 0.25;
-    const SENSITIVITY = 0.0025;
+
+    // Adjusted sensitivity
+    const BASE_SENSITIVITY = 0.0015;
+    const MOBILE_SENSITIVITY = 0.060; // faster pan for mobile
     const DAMPING = 0.08;
     const AUTOPLAY_SPEED = 0.05;
+
+    // Auto-detect sensitivity for device
+    let SENSITIVITY = (window.innerWidth <= 800 || 'ontouchstart' in window)
+      ? MOBILE_SENSITIVITY
+      : BASE_SENSITIVITY;
 
     let scene, camera, renderer, textureLoader;
     let sphereMesh = null;
@@ -279,6 +285,11 @@
       camera.aspect = container.clientWidth / container.clientHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(container.clientWidth, container.clientHeight);
+
+      // update pan speed dynamically if window resized
+      SENSITIVITY = (window.innerWidth <= 800 || 'ontouchstart' in window)
+        ? MOBILE_SENSITIVITY
+        : BASE_SENSITIVITY;
     }
 
     init();
